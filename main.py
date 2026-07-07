@@ -4,7 +4,7 @@ import time
 from collections import defaultdict, deque
 from threading import Lock
 
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import FastAPI, Request, HTTPException, Response, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---- Assigned config ----
@@ -14,6 +14,8 @@ RATE_WINDOW_SECONDS = 10   # per 10s
 
 app = FastAPI()
 
+# CORSMiddleware must be the only/outermost middleware so that EVERY
+# response - including 429s and error responses - gets CORS headers.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,19 +26,16 @@ app.add_middleware(
 # ---- In-memory state ----
 lock = Lock()
 
-# Fixed catalog of orders 1..T, used for pagination scans.
 catalog = [
     {"id": i, "user": f"user{i}", "amount": round(10 + (i * 7 % 90) + 0.5, 2), "status": "catalog"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-# Orders created via POST /orders (idempotent creation), stored separately.
 created_orders = {}          # order_id -> order dict
 idempotency_map = {}         # idempotency_key -> order_id
 next_created_id = TOTAL_ORDERS + 1
 
-# Rate limiting: client_id -> deque of request timestamps (monotonic)
-rate_buckets = defaultdict(deque)
+rate_buckets = defaultdict(deque)  # client_id -> deque of request timestamps
 
 
 def encode_cursor(offset: int) -> str:
@@ -50,34 +49,30 @@ def decode_cursor(cursor: str) -> int:
         raise HTTPException(status_code=400, detail="Invalid cursor")
 
 
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id")
-    if client_id is None:
-        return await call_next(request)
+def enforce_rate_limit(x_client_id: str | None = Header(default=None)):
+    """FastAPI dependency (not middleware) so HTTPException still flows
+    through CORSMiddleware and gets Access-Control-Allow-Origin set."""
+    if x_client_id is None:
+        return
 
     now = time.monotonic()
     with lock:
-        bucket = rate_buckets[client_id]
+        bucket = rate_buckets[x_client_id]
         while bucket and now - bucket[0] > RATE_WINDOW_SECONDS:
             bucket.popleft()
 
         if len(bucket) >= RATE_LIMIT:
             retry_after = max(0, RATE_WINDOW_SECONDS - (now - bucket[0]))
-            headers = {"Retry-After": str(int(retry_after) + 1)}
-            return Response(
-                content='{"detail":"Rate limit exceeded"}',
+            raise HTTPException(
                 status_code=429,
-                media_type="application/json",
-                headers=headers,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(int(retry_after) + 1)},
             )
 
         bucket.append(now)
 
-    return await call_next(request)
 
-
-@app.post("/orders")
+@app.post("/orders", dependencies=[Depends(enforce_rate_limit)])
 async def create_order(request: Request):
     global next_created_id
 
@@ -91,8 +86,7 @@ async def create_order(request: Request):
         with lock:
             existing_id = idempotency_map.get(idempotency_key)
             if existing_id is not None:
-                order = created_orders[existing_id]
-                return order
+                return created_orders[existing_id]
 
     with lock:
         order_id = next_created_id
@@ -114,7 +108,7 @@ async def create_order(request: Request):
     )
 
 
-@app.get("/orders")
+@app.get("/orders", dependencies=[Depends(enforce_rate_limit)])
 async def list_orders(limit: int = 10, cursor: str | None = None):
     if limit <= 0:
         raise HTTPException(status_code=400, detail="limit must be positive")
