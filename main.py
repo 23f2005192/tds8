@@ -188,6 +188,11 @@ def check_rate_limit(client_id: str):
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # Never rate-limit CORS preflight — browsers send OPTIONS with no
+    # X-Client-Id and expect a clean response to proceed with the real call.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     # Only rate-limit the business endpoints, keyed by X-Client-Id.
     if request.url.path.startswith("/orders"):
         client_id = request.headers.get("X-Client-Id") or request.headers.get("x-client-id")
@@ -196,10 +201,21 @@ async def rate_limit_middleware(request: Request, call_next):
 
         allowed, retry_after = check_rate_limit(client_id)
         if not allowed:
+            # This response is generated here, before Starlette's CORSMiddleware
+            # gets a chance to run, so it would normally go out with NO
+            # Access-Control-Allow-Origin header. Browsers then block it and
+            # surface it as a generic "Failed to fetch" instead of a real 429.
+            # Set the CORS headers manually so the error is visible to callers.
+            origin = request.headers.get("origin", "*")
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
+                headers={
+                    "Retry-After": str(retry_after),
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Credentials": "false",
+                    "Vary": "Origin",
+                },
             )
 
     response = await call_next(request)
