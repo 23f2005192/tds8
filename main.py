@@ -1,129 +1,151 @@
-import base64
-import json
-import time
-from collections import defaultdict, deque
-from threading import Lock
-
-from fastapi import FastAPI, Request, HTTPException, Response, Header, Depends
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ---- Assigned config ----
-TOTAL_ORDERS = 58          # T
-RATE_LIMIT = 16            # R requests
-RATE_WINDOW_SECONDS = 10   # per 10s
+from collections import defaultdict, deque
+from threading import Lock
+import base64
+import time
+
+TOTAL_ORDERS = 58
+RATE_LIMIT = 16
+WINDOW = 10
 
 app = FastAPI()
 
-# CORSMiddleware must be the only/outermost middleware so that EVERY
-# response - including 429s and error responses - gets CORS headers.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],      # or the exam origin if specified
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
-# ---- In-memory state ----
 lock = Lock()
 
 catalog = [
-    {"id": i, "user": f"user{i}", "amount": round(10 + (i * 7 % 90) + 0.5, 2), "status": "catalog"}
+    {
+        "id": i,
+        "user": f"user{i}",
+        "amount": float(i * 10),
+        "status": "catalog",
+    }
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-created_orders = {}          # order_id -> order dict
-idempotency_map = {}         # idempotency_key -> order_id
-next_created_id = TOTAL_ORDERS + 1
+created_orders = {}
+idempotency_map = {}
+next_order_id = TOTAL_ORDERS + 1
 
-rate_buckets = defaultdict(deque)  # client_id -> deque of request timestamps
+rate_buckets = defaultdict(deque)
 
 
-def encode_cursor(offset: int) -> str:
+def encode_cursor(offset: int):
     return base64.urlsafe_b64encode(str(offset).encode()).decode()
 
 
-def decode_cursor(cursor: str) -> int:
-    try:
-        return int(base64.urlsafe_b64decode(cursor.encode()).decode())
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+def decode_cursor(cursor: str):
+    return int(base64.urlsafe_b64decode(cursor.encode()).decode())
 
 
-def enforce_rate_limit(x_client_id: str | None = Header(default=None)):
-    """FastAPI dependency (not middleware) so HTTPException still flows
-    through CORSMiddleware and gets Access-Control-Allow-Origin set."""
-    if x_client_id is None:
-        return
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
 
-    now = time.monotonic()
-    with lock:
-        bucket = rate_buckets[x_client_id]
-        while bucket and now - bucket[0] > RATE_WINDOW_SECONDS:
-            bucket.popleft()
+    client = request.headers.get("X-Client-Id")
 
-        if len(bucket) >= RATE_LIMIT:
-            retry_after = max(0, RATE_WINDOW_SECONDS - (now - bucket[0]))
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": str(int(retry_after) + 1)},
-            )
+    if client:
 
-        bucket.append(now)
+        now = time.monotonic()
 
-
-@app.post("/orders", dependencies=[Depends(enforce_rate_limit)])
-async def create_order(request: Request):
-    global next_created_id
-
-    idempotency_key = request.headers.get("Idempotency-Key")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    if idempotency_key:
         with lock:
-            existing_id = idempotency_map.get(idempotency_key)
-            if existing_id is not None:
-                return created_orders[existing_id]
+
+            bucket = rate_buckets[client]
+
+            while bucket and now - bucket[0] >= WINDOW:
+                bucket.popleft()
+
+            if len(bucket) >= RATE_LIMIT:
+
+                retry_after = max(
+                    1,
+                    int(WINDOW - (now - bucket[0])) + 1
+                )
+
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                    headers={
+                        "Retry-After": str(retry_after)
+                    },
+                )
+
+            bucket.append(now)
+
+    return await call_next(request)
+
+
+@app.post("/orders")
+async def create_order(request: Request):
+
+    global next_order_id
+
+    body = await request.json()
+
+    key = request.headers.get("Idempotency-Key")
 
     with lock:
-        order_id = next_created_id
-        next_created_id += 1
+
+        if key and key in idempotency_map:
+
+            order_id = idempotency_map[key]
+
+            return created_orders[order_id]
+
         order = {
-            "id": order_id,
-            "user": body.get("user", f"user{order_id}"),
+            "id": next_order_id,
+            "user": body.get("user", f"user{next_order_id}"),
             "amount": body.get("amount", 0),
             "status": "created",
         }
-        created_orders[order_id] = order
-        if idempotency_key:
-            idempotency_map[idempotency_key] = order_id
 
-    return Response(
-        content=json.dumps(order),
+        created_orders[next_order_id] = order
+
+        if key:
+            idempotency_map[key] = next_order_id
+
+        next_order_id += 1
+
+    return JSONResponse(
         status_code=201,
-        media_type="application/json",
+        content=order,
     )
 
 
-@app.get("/orders", dependencies=[Depends(enforce_rate_limit)])
+@app.get("/orders")
 async def list_orders(limit: int = 10, cursor: str | None = None):
+
     if limit <= 0:
-        raise HTTPException(status_code=400, detail="limit must be positive")
+        limit = 10
 
     offset = decode_cursor(cursor) if cursor else 0
-    if offset < 0 or offset > TOTAL_ORDERS:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    items = catalog[offset: offset + limit]
-    new_offset = offset + len(items)
-    next_cursor = encode_cursor(new_offset) if new_offset < TOTAL_ORDERS else None
+    items = catalog[offset:offset + limit]
+
+    next_offset = offset + len(items)
+
+    next_cursor = (
+        encode_cursor(next_offset)
+        if next_offset < TOTAL_ORDERS
+        else None
+    )
 
     return {
         "items": items,
-        "orders": items,
         "next_cursor": next_cursor,
-        "next": next_cursor,
     }
+
+
+@app.get("/")
+async def root():
+    return {"status": "running"}
