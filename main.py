@@ -1,149 +1,123 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-from collections import defaultdict, deque
-from threading import Lock
-import base64
-import time
-
-TOTAL_ORDERS = 58
-RATE_LIMIT = 16
-WINDOW = 10
+from fastapi import FastAPI
+from pydantic import BaseModel
+import re
+from datetime import datetime
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],      # or the exam origin if specified
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
-)
 
-lock = Lock()
-
-catalog = [
-    {
-        "id": i,
-        "user": f"user{i}",
-        "amount": float(i * 10),
-        "status": "catalog",
-    }
-    for i in range(1, TOTAL_ORDERS + 1)
-]
-
-created_orders = {}
-idempotency_map = {}
-next_order_id = TOTAL_ORDERS + 1
-
-rate_buckets = defaultdict(deque)
+class InvoiceRequest(BaseModel):
+    text: str
 
 
-def encode_cursor(offset: int):
-    return base64.urlsafe_b64encode(str(offset).encode()).decode()
+class InvoiceResponse(BaseModel):
+    vendor: str
+    amount: float
+    currency: str
+    date: str
 
 
-def decode_cursor(cursor: str):
-    return int(base64.urlsafe_b64decode(cursor.encode()).decode())
+CURRENCIES = ["USD", "EUR", "GBP"]
 
 
-@app.middleware("http")
-async def rate_limit(request: Request, call_next):
+@app.post("/extract", response_model=InvoiceResponse)
+async def extract(req: InvoiceRequest):
 
-    client = request.headers.get("X-Client-Id")
+    text = req.text.strip()
 
-    if client:
+    if not text:
+        return InvoiceResponse(
+            vendor="",
+            amount=0.0,
+            currency="USD",
+            date=""
+        )
 
-        now = time.monotonic()
+    # -------------------------
+    # Currency
+    # -------------------------
 
-        with lock:
+    currency = "USD"
 
-            bucket = rate_buckets[client]
+    m = re.search(r"\b(USD|EUR|GBP)\b", text, re.IGNORECASE)
 
-            while bucket and now - bucket[0] >= WINDOW:
-                bucket.popleft()
+    if m:
+        currency = m.group(1).upper()
 
-            if len(bucket) >= RATE_LIMIT:
+    # -------------------------
+    # Amount
+    # -------------------------
 
-                retry_after = max(
-                    1,
-                    int(WINDOW - (now - bucket[0])) + 1
-                )
+    amount = 0.0
 
-                return JSONResponse(
-                    status_code=429,
-                    content={"detail": "Rate limit exceeded"},
-                    headers={
-                        "Retry-After": str(retry_after)
-                    },
-                )
+    patterns = [
+        r"total\s+due[:\s]*[$€£]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        r"amount\s+due[:\s]*[$€£]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        r"balance\s+due[:\s]*[$€£]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+        r"[$€£]\s*([0-9]+(?:\.[0-9]{1,2})?)",
+    ]
 
-            bucket.append(now)
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1))
+            break
 
-    return await call_next(request)
+    # -------------------------
+    # Date
+    # -------------------------
 
+    date = ""
 
-@app.post("/orders")
-async def create_order(request: Request):
+    m = re.search(r"\b(20\d\d-\d\d-\d\d)\b", text)
 
-    global next_order_id
+    if m:
+        date = m.group(1)
+    else:
 
-    body = await request.json()
+        m = re.search(
+            r"(\d{1,2})/(\d{1,2})/(20\d\d)",
+            text
+        )
 
-    key = request.headers.get("Idempotency-Key")
+        if m:
+            d, mo, y = m.groups()
+            date = datetime(
+                int(y),
+                int(mo),
+                int(d)
+            ).strftime("%Y-%m-%d")
 
-    with lock:
+    # -------------------------
+    # Vendor
+    # -------------------------
 
-        if key and key in idempotency_map:
+    vendor = ""
 
-            order_id = idempotency_map[key]
+    patterns = [
+        r"Vendor[:\s]*(.+)",
+        r"Supplier[:\s]*(.+)",
+        r"From[:\s]*(.+)",
+        r"Billed by[:\s]*(.+)",
+    ]
 
-            return created_orders[order_id]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            vendor = m.group(1).split("\n")[0].strip()
+            break
 
-        order = {
-            "id": next_order_id,
-            "user": body.get("user", f"user{next_order_id}"),
-            "amount": body.get("amount", 0),
-            "status": "created",
-        }
+    if not vendor:
+        lines = [x.strip() for x in text.splitlines() if x.strip()]
+        if lines:
+            vendor = lines[0]
 
-        created_orders[next_order_id] = order
-
-        if key:
-            idempotency_map[key] = next_order_id
-
-        next_order_id += 1
-
-    return JSONResponse(
-        status_code=201,
-        content=order,
+    return InvoiceResponse(
+        vendor=vendor,
+        amount=amount,
+        currency=currency,
+        date=date,
     )
-
-
-@app.get("/orders")
-async def list_orders(limit: int = 10, cursor: str | None = None):
-
-    if limit <= 0:
-        limit = 10
-
-    offset = decode_cursor(cursor) if cursor else 0
-
-    items = catalog[offset:offset + limit]
-
-    next_offset = offset + len(items)
-
-    next_cursor = (
-        encode_cursor(next_offset)
-        if next_offset < TOTAL_ORDERS
-        else None
-    )
-
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-    }
 
 
 @app.get("/")
